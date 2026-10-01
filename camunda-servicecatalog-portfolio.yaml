@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Registers the Camunda ECS Fargate stack as an AWS Service Catalog product:
+  portfolio, product (v1), launch role + launch constraint, and access for one
+  IAM principal. Deploy this once per account/region.
+
+Parameters:
+  ProductTemplateUrl:
+    Type: String
+    Description: HTTPS S3 URL of camunda-ecs-product.yaml (e.g. https://my-bucket.s3.eu-west-2.amazonaws.com/camunda/camunda-ecs-product.yaml)
+  ProductVersionName:
+    Type: String
+    Default: v1-camunda-8.9
+  EndUserPrincipalArn:
+    Type: String
+    Description: ARN of the IAM role or user that should be able to launch the product (e.g. your admin role / SSO permission-set role)
+  OwnerName:
+    Type: String
+    Default: Platform Team
+  CreateEcsServiceLinkedRole:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      A fresh account has no AWSServiceRoleForECS yet. Set to false if
+      `aws iam get-role --role-name AWSServiceRoleForECS` already succeeds.
+
+Rules:
+  OnlyEuWest2:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', eu-west-2]
+        AssertDescription: Deploy this portfolio stack in eu-west-2 (London), the same region as the product.
+
+Conditions:
+  CreateEcsSlr: !Equals [!Ref CreateEcsServiceLinkedRole, 'true']
+
+Resources:
+  EcsServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Condition: CreateEcsSlr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AWSServiceName: ecs.amazonaws.com
+
+  Portfolio:
+    Type: AWS::ServiceCatalog::Portfolio
+    Properties:
+      DisplayName: Workflow Platforms
+      ProviderName: !Ref OwnerName
+      Description: Self-service workflow engine environments
+
+  CamundaProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    Properties:
+      Name: Camunda 8 on ECS Fargate
+      Owner: !Ref OwnerName
+      Distributor: !Ref OwnerName
+      Description: >-
+        Camunda 8.9 Orchestration Cluster (Zeebe, Operate, Tasklist, Admin) and Connectors
+        on ECS Fargate with Aurora PostgreSQL, EFS and its own VPC.
+      SupportDescription: Contact the platform team
+      ProvisioningArtifactParameters:
+        - Name: !Ref ProductVersionName
+          Description: Based on camunda-deployment-references stable/8.9 ecs-single-region-fargate
+          Info:
+            LoadTemplateFromURL: !Ref ProductTemplateUrl
+
+  PortfolioProductAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      ProductId: !Ref CamundaProduct
+
+  PortfolioPrincipalAssociation:
+    Type: AWS::ServiceCatalog::PortfolioPrincipalAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      PrincipalARN: !Ref EndUserPrincipalArn
+      PrincipalType: IAM
+
+  # Service Catalog assumes this role to run the product's CloudFormation stack,
+  # so end users don't need permissions on the underlying services themselves.
+  LaunchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Service Catalog launch role for the Camunda ECS product
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: servicecatalog.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: camunda-product-provisioning
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:TagResource
+                Resource: '*'
+              - Sid: ReadProductTemplate
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: '*'
+                Condition:
+                  StringEquals: { 's3:ExistingObjectTag/servicecatalog:provisioning': 'true' }
+              - Sid: ProductServices
+                Effect: Allow
+                Action:
+                  - ec2:*
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - rds:*
+                  - elasticfilesystem:*
+                  - s3:*
+                  - secretsmanager:*
+                  - logs:*
+                  - servicediscovery:*
+                  - route53:*
+                  - lambda:*
+                  - ssm:GetParameters
+                Resource: '*'
+              - Sid: KmsForManagedEncryption
+                Effect: Allow
+                Action: [kms:CreateGrant, kms:Decrypt, kms:DescribeKey, kms:Encrypt, kms:GenerateDataKey*, kms:ReEncrypt*]
+                Resource: '*'
+              - Sid: IamRolesForProduct
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PassRole
+                Resource: '*'
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'iam:AWSServiceName':
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+                      - elasticfilesystem.amazonaws.com
+                      - servicediscovery.amazonaws.com
+
+  LaunchRoleConstraint:
+    Type: AWS::ServiceCatalog::LaunchRoleConstraint
+    DependsOn: PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      ProductId: !Ref CamundaProduct
+      RoleArn: !GetAtt LaunchRole.Arn
+      Description: Provision Camunda using the platform launch role
+
+Outputs:
+  PortfolioId:
+    Value: !Ref Portfolio
+  ProductId:
+    Value: !Ref CamundaProduct
+  LaunchRoleArn:
+    Value: !GetAtt LaunchRole.Arn

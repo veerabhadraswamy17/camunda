@@ -1,0 +1,50 @@
+{
+  "family": "camunda-oc1-connectors",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/camunda-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/camunda-oc1-connectors-task-role",
+  "containerDefinitions": [
+    {
+      "name": "connectors",
+      "image": "<ACCOUNT_ID>.dkr.ecr.eu-west-2.amazonaws.com/camunda/connectors-bundle:8.9.7",
+      "cpu": 2048,
+      "memory": 4096,
+      "essential": true,
+      "stopTimeout": 30,
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget --spider --quiet http://localhost:8080/connectors/actuator/health/readiness || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "portMappings": [
+        { "containerPort": 8080, "hostPort": 8080, "protocol": "tcp", "name": "http" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/camunda-oc1-camunda",
+          "awslogs-region": "eu-west-2",
+          "awslogs-stream-prefix": "connectors",
+          "awslogs-multiline-pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z"
+        }
+      },
+      "environment": [
+        { "name": "SERVER_SERVLET_CONTEXT_PATH", "value": "/connectors" },
+        { "name": "CAMUNDA_CLIENT_MODE", "value": "self-managed" },
+        { "name": "CAMUNDA_CLIENT_RESTADDRESS", "value": "http://orchestration-cluster-rest:8080" },
+        { "name": "CAMUNDA_CLIENT_GRPCADDRESS", "value": "http://orchestration-cluster-grpc:26500" },
+        { "name": "CAMUNDA_CLIENT_AUTH_METHOD", "value": "basic" },
+        { "name": "CAMUNDA_CLIENT_AUTH_USERNAME", "value": "connectors" }
+      ],
+      "secrets": [
+        { "name": "CAMUNDA_CLIENT_AUTH_PASSWORD", "valueFrom": "<CONNECTORS_PASSWORD_SECRET_ARN>" }
+      ]
+    }
+  ]
+}

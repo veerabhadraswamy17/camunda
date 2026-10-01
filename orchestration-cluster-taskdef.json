@@ -1,0 +1,92 @@
+{
+  "family": "camunda-oc1-orchestration-cluster",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "4096",
+  "memory": "8192",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/camunda-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/camunda-oc1-orchestration-task-role",
+  "volumes": [
+    {
+      "name": "camunda-volume",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "<EFS_FILE_SYSTEM_ID>",
+        "rootDirectory": "/",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": { "accessPointId": "<EFS_ACCESS_POINT_ID>", "iam": "ENABLED" }
+      }
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "orchestration-cluster",
+      "image": "<ACCOUNT_ID>.dkr.ecr.eu-west-2.amazonaws.com/camunda/camunda:8.9.16",
+      "cpu": 4096,
+      "memory": 8192,
+      "essential": true,
+      "stopTimeout": 30,
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget --spider --quiet http://localhost:9600/actuator/health/liveness || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "portMappings": [
+        { "containerPort": 26500, "hostPort": 26500, "protocol": "tcp", "name": "grpc" },
+        { "containerPort": 26501, "hostPort": 26501, "protocol": "tcp", "name": "command-api" },
+        { "containerPort": 26502, "hostPort": 26502, "protocol": "tcp", "name": "internal-api" },
+        { "containerPort": 9600, "hostPort": 9600, "protocol": "tcp", "name": "management" },
+        { "containerPort": 8080, "hostPort": 8080, "protocol": "tcp", "name": "rest" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "camunda-volume", "containerPath": "/usr/local/camunda/data" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/camunda-oc1-camunda",
+          "awslogs-region": "eu-west-2",
+          "awslogs-stream-prefix": "orchestration-cluster",
+          "awslogs-multiline-pattern": "^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}\\]"
+        }
+      },
+      "environment": [
+        { "name": "SPRING_LIFECYCLE_TIMEOUTPERSHUTDOWNPHASE", "value": "5s" },
+        { "name": "ZEEBE_BROKER_DATA_DIRECTORY", "value": "/usr/local/camunda/data" },
+
+        { "name": "CAMUNDA_CLUSTER_INITIALCONTACTPOINTS", "value": "orchestration-cluster-sc:26502" },
+        { "name": "CAMUNDA_CLUSTER_SIZE", "value": "3" },
+        { "name": "CAMUNDA_CLUSTER_REPLICATIONFACTOR", "value": "3" },
+        { "name": "CAMUNDA_CLUSTER_PARTITIONCOUNT", "value": "3" },
+
+        { "name": "CAMUNDA_CLUSTER_NODEIDPROVIDER_TYPE", "value": "s3" },
+        { "name": "CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_BUCKETNAME", "value": "<NODE_ID_BUCKET>" },
+        { "name": "CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_LEASEDURATION", "value": "PT15S" },
+        { "name": "CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_REGION", "value": "eu-west-2" },
+
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_AUTOCONFIGURECAMUNDAEXPORTER", "value": "false" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_TYPE", "value": "rdbms" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_URL", "value": "jdbc:postgresql://<AURORA_WRITER_ENDPOINT>:5432/camunda" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_USERNAME", "value": "camunda_admin" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_AUTODDL", "value": "true" },
+
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_USERNAME", "value": "admin" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_NAME", "value": "Admin User" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_EMAIL", "value": "admin@example.com" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_ADMIN_USERS_0", "value": "admin" },
+
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_1_USERNAME", "value": "connectors" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_1_NAME", "value": "Connectors User" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_1_EMAIL", "value": "connectors@example.com" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_CONNECTORS_USERS_0", "value": "connectors" }
+      ],
+      "secrets": [
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_PASSWORD", "valueFrom": "<ADMIN_PASSWORD_SECRET_ARN>" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_1_PASSWORD", "valueFrom": "<CONNECTORS_PASSWORD_SECRET_ARN>" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_PASSWORD", "valueFrom": "<DB_PASSWORD_SECRET_ARN>" }
+      ]
+    }
+  ]
+}

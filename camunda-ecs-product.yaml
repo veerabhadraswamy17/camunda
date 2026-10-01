@@ -1,0 +1,870 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  [eu-west-2 / London]
+  Camunda 8.9 Orchestration Cluster + Connectors on ECS Fargate with Aurora PostgreSQL
+  (secondary storage), EFS (broker data) and S3 (node-id leases). Self-contained:
+  creates its own VPC. Based on camunda/camunda-deployment-references stable/8.9
+  aws/containers/ecs-single-region-fargate. Intended to be registered as a
+  Service Catalog product.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Access }
+        Parameters: [AllowedCidr, LoadBalancerScheme, EnableGrpcLoadBalancer]
+      - Label: { default: Camunda }
+        Parameters: [BrokerCount, OrchestrationTaskSize, OrchestrationImage, ConnectorsImage, AdminEmail]
+      - Label: { default: Database }
+        Parameters: [DBEngineVersion, DBInstanceClass]
+      - Label: { default: Network }
+        Parameters: [VpcCidr]
+    ParameterLabels:
+      AllowedCidr: { default: CIDR allowed to reach the web UI / gRPC (e.g. your office IP/32) }
+      LoadBalancerScheme: { default: Load balancer scheme }
+      EnableGrpcLoadBalancer: { default: Create gRPC Network Load Balancer (port 26500) }
+      BrokerCount: { default: 'Number of brokers (1 = cheap PoC; 3 = HA like the reference)' }
+      OrchestrationTaskSize: { default: Orchestration Cluster task size }
+
+Parameters:
+  AllowedCidr:
+    Type: String
+    Description: Only this CIDR can reach the load balancers. Use your public IP/32 for an internet-facing PoC.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a CIDR such as 203.0.113.10/32
+  LoadBalancerScheme:
+    Type: String
+    Default: internet-facing
+    AllowedValues: [internet-facing, internal]
+    Description: internal only makes sense if you have VPN / Direct Connect into this VPC.
+  EnableGrpcLoadBalancer:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  BrokerCount:
+    Type: String
+    Default: '3'
+    AllowedValues: ['1', '3']
+  OrchestrationTaskSize:
+    Type: String
+    Default: medium
+    AllowedValues: [small, medium]
+    Description: small = 2 vCPU / 4 GB, medium = 4 vCPU / 8 GB (reference default)
+  OrchestrationImage:
+    Type: String
+    Default: camunda/camunda:8.9.16
+    Description: Docker Hub name or full ECR URI (<acct>.dkr.ecr.eu-west-2.amazonaws.com/repo:tag)
+  ConnectorsImage:
+    Type: String
+    Default: camunda/connectors-bundle:8.9.7
+    Description: Docker Hub name or full ECR URI. Keep on the same 8.9 minor as the orchestration image.
+  AdminEmail:
+    Type: String
+    Default: admin@example.com
+  DBEngineVersion:
+    Type: String
+    Default: '17.9'
+    Description: Aurora PostgreSQL engine version (17.9 released April 2026; db.t3.medium supports 17.4+)
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+  VpcCidr:
+    Type: String
+    Default: 10.190.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    ConstraintDescription: Must be a /16
+
+Rules:
+  OnlyEuWest2:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', eu-west-2]
+        AssertDescription: This product is built for eu-west-2 (London). Launch it in eu-west-2.
+
+Mappings:
+  TaskSize:
+    small:  { Cpu: '2048', Memory: '4096' }
+    medium: { Cpu: '4096', Memory: '8192' }
+
+Conditions:
+  IsSingleBroker: !Equals [!Ref BrokerCount, '1']
+  CreateGrpcLb: !Equals [!Ref EnableGrpcLoadBalancer, 'true']
+  IsInternetFacing: !Equals [!Ref LoadBalancerScheme, internet-facing]
+
+Resources:
+  ##########################################################################
+  # Network: 3 public + 3 private subnets, 1 NAT gateway, S3 gateway endpoint
+  ##########################################################################
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public-1' }]
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public-2' }]
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public-3' }]
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-1' }]
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-2' }]
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-3' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnet2Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnet3Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet3, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+  PrivateSubnet2Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+  PrivateSubnet3Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet3, RouteTableId: !Ref PrivateRouteTable }
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  ##########################################################################
+  # Security groups
+  ##########################################################################
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Camunda load balancers - access from AllowedCidr
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr, Description: Web UI and REST API }
+        - { IpProtocol: tcp, FromPort: 26500, ToPort: 26500, CidrIp: !Ref AllowedCidr, Description: Zeebe gRPC }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 9600, ToPort: 9600, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 26500, ToPort: 26500, CidrIp: !Ref VpcCidr }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Camunda ECS tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref VpcCidr, Description: REST / web apps / connectors }
+        - { IpProtocol: tcp, FromPort: 9600, ToPort: 9600, CidrIp: !Ref VpcCidr, Description: Management / health }
+        - { IpProtocol: tcp, FromPort: 26500, ToPort: 26502, CidrIp: !Ref VpcCidr, Description: Zeebe gateway / command / cluster }
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0, Description: 'Image pulls via NAT; AWS APIs; intra-VPC' }
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Camunda EFS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref TaskSecurityGroup }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Camunda Aurora PostgreSQL
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref TaskSecurityGroup }
+
+  ##########################################################################
+  # Secrets (generated, plain strings, no punctuation to keep them URL/env safe)
+  ##########################################################################
+  AdminPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Camunda admin user password (${AWS::StackName})'
+      GenerateSecretString: { PasswordLength: 32, ExcludePunctuation: true }
+  ConnectorsPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Camunda connectors user password (${AWS::StackName})'
+      GenerateSecretString: { PasswordLength: 32, ExcludePunctuation: true }
+  DbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Aurora master password for camunda_admin (${AWS::StackName})'
+      GenerateSecretString: { PasswordLength: 32, ExcludePunctuation: true }
+
+  ##########################################################################
+  # Aurora PostgreSQL (secondary storage)
+  ##########################################################################
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Camunda Aurora private subnets
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref DBEngineVersion
+      DatabaseName: camunda
+      MasterUsername: camunda_admin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbPasswordSecret}}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DatabaseSecurityGroup]
+      StorageEncrypted: true
+      DeletionProtection: false
+      BackupRetentionPeriod: 7
+
+  DbInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: !Ref DBInstanceClass
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: false
+
+  ##########################################################################
+  # EFS (broker data)
+  ##########################################################################
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags: [{ Key: Name, Value: !Sub '${AWS::StackName}-efs' }]
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: { FileSystemId: !Ref FileSystem, SubnetId: !Ref PrivateSubnet1, SecurityGroups: [!Ref EfsSecurityGroup] }
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: { FileSystemId: !Ref FileSystem, SubnetId: !Ref PrivateSubnet2, SecurityGroups: [!Ref EfsSecurityGroup] }
+  MountTarget3:
+    Type: AWS::EFS::MountTarget
+    Properties: { FileSystemId: !Ref FileSystem, SubnetId: !Ref PrivateSubnet3, SecurityGroups: [!Ref EfsSecurityGroup] }
+
+  CamundaDataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: { Uid: '1000', Gid: '1000' }
+      RootDirectory:
+        Path: /usr/local/camunda/data
+        CreationInfo: { OwnerUid: '1000', OwnerGid: '1000', Permissions: '755' }
+
+  ##########################################################################
+  # S3 bucket for broker node-id leases (+ cleaner so the product can be terminated)
+  ##########################################################################
+  NodeIdBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BucketCleanerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: empty-node-id-bucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions]
+                Resource: !GetAtt NodeIdBucket.Arn
+              - Effect: Allow
+                Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+                Resource: !Sub '${NodeIdBucket.Arn}/*'
+
+  BucketCleanerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Empties the Camunda node-id bucket when the stack is deleted
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt BucketCleanerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      bucket = boto3.resource('s3').Bucket(event['ResourceProperties']['BucketName'])
+                      bucket.object_versions.delete()
+                      bucket.objects.all().delete()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  BucketCleaner:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !GetAtt BucketCleanerFunction.Arn
+      BucketName: !Ref NodeIdBucket
+
+  ##########################################################################
+  # IAM roles for ECS
+  ##########################################################################
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-camunda-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref AdminPasswordSecret
+                  - !Ref ConnectorsPasswordSecret
+                  - !Ref DbPasswordSecret
+
+  OrchestrationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orchestration-cluster
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NodeIdBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt NodeIdBucket.Arn
+              - Sid: NodeIdObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${NodeIdBucket.Arn}/*'
+              - Sid: EfsClient
+                Effect: Allow
+                Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite, elasticfilesystem:ClientRootAccess]
+                Resource: !GetAtt FileSystem.Arn
+                Condition: { Bool: { 'aws:SecureTransport': 'true' } }
+              - Sid: EcsExec
+                Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: '*'
+
+  ConnectorsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: connectors
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcsExec
+                Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: '*'
+
+  ##########################################################################
+  # Load balancers
+  ##########################################################################
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Type: application
+      Scheme: !Ref LoadBalancerScheme
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Subnets: !If
+        - IsInternetFacing
+        - [!Ref PublicSubnet1, !Ref PublicSubnet2, !Ref PublicSubnet3]
+        - [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+
+  OrchestrationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9600'
+      HealthCheckPath: /actuator/health/readiness
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        - { Key: stickiness.enabled, Value: 'true' }
+        - { Key: stickiness.type, Value: lb_cookie }
+        - { Key: stickiness.lb_cookie.duration_seconds, Value: '43200' }
+
+  ConnectorsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8080'
+      HealthCheckPath: /connectors/actuator/health/readiness
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        - { Key: stickiness.enabled, Value: 'true' }
+        - { Key: stickiness.type, Value: lb_cookie }
+        - { Key: stickiness.lb_cookie.duration_seconds, Value: '43200' }
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrchestrationTargetGroup
+
+  ConnectorsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref WebListener
+      Priority: 50
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/connectors*'] }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ConnectorsTargetGroup
+
+  GrpcLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: CreateGrpcLb
+    DependsOn: GatewayAttachment
+    Properties:
+      Type: network
+      Scheme: !Ref LoadBalancerScheme
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Subnets: !If
+        - IsInternetFacing
+        - [!Ref PublicSubnet1, !Ref PublicSubnet2, !Ref PublicSubnet3]
+        - [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+
+  GrpcTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateGrpcLb
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: TCP
+      Port: 26500
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9600'
+      HealthCheckPath: /actuator/health/readiness
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  GrpcListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateGrpcLb
+    Properties:
+      LoadBalancerArn: !Ref GrpcLoadBalancer
+      Port: 26500
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GrpcTargetGroup
+
+  ##########################################################################
+  # ECS cluster, Service Connect namespace, logs
+  ##########################################################################
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  ServiceConnectNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Sub '${AWS::StackName}-sc'
+      Description: Service Connect namespace for Camunda
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-camunda'
+      RetentionInDays: 30
+
+  ##########################################################################
+  # Orchestration Cluster (Zeebe + Operate + Tasklist + Identity + REST API)
+  ##########################################################################
+  OrchestrationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-orchestration-cluster'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [TaskSize, !Ref OrchestrationTaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref OrchestrationTaskSize, Memory]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt OrchestrationTaskRole.Arn
+      Volumes:
+        - Name: camunda-volume
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            RootDirectory: /
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref CamundaDataAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: orchestration-cluster
+          Image: !Ref OrchestrationImage
+          Essential: true
+          StopTimeout: 30
+          HealthCheck:
+            Command: [CMD-SHELL, 'wget --spider --quiet http://localhost:9600/actuator/health/liveness || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          PortMappings:
+            - { Name: grpc, ContainerPort: 26500, Protocol: tcp }
+            - { Name: command-api, ContainerPort: 26501, Protocol: tcp }
+            - { Name: internal-api, ContainerPort: 26502, Protocol: tcp }
+            - { Name: management, ContainerPort: 9600, Protocol: tcp }
+            - { Name: rest, ContainerPort: 8080, Protocol: tcp }
+          MountPoints:
+            - { SourceVolume: camunda-volume, ContainerPath: /usr/local/camunda/data }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orchestration-cluster
+              awslogs-multiline-pattern: '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]'
+          Environment:
+            - { Name: SPRING_LIFECYCLE_TIMEOUTPERSHUTDOWNPHASE, Value: 5s }
+            - { Name: ZEEBE_BROKER_DATA_DIRECTORY, Value: /usr/local/camunda/data }
+            # Cluster
+            - { Name: CAMUNDA_CLUSTER_INITIALCONTACTPOINTS, Value: 'orchestration-cluster-sc:26502' }
+            - { Name: CAMUNDA_CLUSTER_SIZE, Value: !Ref BrokerCount }
+            - { Name: CAMUNDA_CLUSTER_REPLICATIONFACTOR, Value: !Ref BrokerCount }
+            - { Name: CAMUNDA_CLUSTER_PARTITIONCOUNT, Value: !Ref BrokerCount }
+            # Node id provider (S3 leases)
+            - { Name: CAMUNDA_CLUSTER_NODEIDPROVIDER_TYPE, Value: s3 }
+            - { Name: CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_BUCKETNAME, Value: !Ref NodeIdBucket }
+            - { Name: CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_LEASEDURATION, Value: PT15S }
+            - { Name: CAMUNDA_CLUSTER_NODEIDPROVIDER_S3_REGION, Value: !Ref AWS::Region }
+            # Secondary storage: Aurora PostgreSQL (password auth)
+            - { Name: CAMUNDA_DATA_SECONDARYSTORAGE_AUTOCONFIGURECAMUNDAEXPORTER, Value: 'false' }
+            - { Name: CAMUNDA_DATA_SECONDARYSTORAGE_TYPE, Value: rdbms }
+            - Name: CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_URL
+              Value: !Sub 'jdbc:postgresql://${DbCluster.Endpoint.Address}:5432/camunda'
+            - { Name: CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_USERNAME, Value: camunda_admin }
+            - { Name: CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_AUTODDL, Value: 'true' }
+            # Initial users
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_0_USERNAME, Value: admin }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_0_NAME, Value: Admin User }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_0_EMAIL, Value: !Ref AdminEmail }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_ADMIN_USERS_0, Value: admin }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_1_USERNAME, Value: connectors }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_1_NAME, Value: Connectors User }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_1_EMAIL, Value: connectors@example.com }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_CONNECTORS_USERS_0, Value: connectors }
+          Secrets:
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_0_PASSWORD, ValueFrom: !Ref AdminPasswordSecret }
+            - { Name: CAMUNDA_SECURITY_INITIALIZATION_USERS_1_PASSWORD, ValueFrom: !Ref ConnectorsPasswordSecret }
+            - { Name: CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_PASSWORD, ValueFrom: !Ref DbPasswordSecret }
+
+  OrchestrationService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - WebListener
+      - MountTarget1
+      - MountTarget2
+      - MountTarget3
+      - DbInstance1
+      - BucketCleaner
+      - PrivateDefaultRoute
+      - PrivateSubnet1Rta
+      - PrivateSubnet2Rta
+      - PrivateSubnet3Rta
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref OrchestrationTaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: !Ref BrokerCount
+      HealthCheckGracePeriodSeconds: 900
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: !If [IsSingleBroker, 0, 66]
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+        Services:
+          - PortName: grpc
+            DiscoveryName: orchestration-cluster-grpc
+            ClientAliases: [{ Port: 26500, DnsName: orchestration-cluster-grpc }]
+          - PortName: internal-api
+            DiscoveryName: orchestration-cluster-sc
+            ClientAliases: [{ Port: 26502, DnsName: orchestration-cluster-sc }]
+          - PortName: rest
+            DiscoveryName: orchestration-cluster-rest
+            ClientAliases: [{ Port: 8080, DnsName: orchestration-cluster-rest }]
+      LoadBalancers:
+        - ContainerName: orchestration-cluster
+          ContainerPort: 8080
+          TargetGroupArn: !Ref OrchestrationTargetGroup
+        - !If
+          - CreateGrpcLb
+          - ContainerName: orchestration-cluster
+            ContainerPort: 26500
+            TargetGroupArn: !Ref GrpcTargetGroup
+          - !Ref AWS::NoValue
+      Tags:
+        # Forces creation after the gRPC listener when it exists (DependsOn cannot be conditional)
+        - Key: camunda-grpc-listener
+          Value: !If [CreateGrpcLb, !Ref GrpcListener, none]
+
+  ##########################################################################
+  # Connectors
+  ##########################################################################
+  ConnectorsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-connectors'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '2048'
+      Memory: '4096'
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ConnectorsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: connectors
+          Image: !Ref ConnectorsImage
+          Essential: true
+          StopTimeout: 30
+          HealthCheck:
+            Command: [CMD-SHELL, 'wget --spider --quiet http://localhost:8080/connectors/actuator/health/readiness || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          PortMappings:
+            - { Name: http, ContainerPort: 8080, Protocol: tcp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: connectors
+              awslogs-multiline-pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z'
+          Environment:
+            - { Name: SERVER_SERVLET_CONTEXT_PATH, Value: /connectors }
+            - { Name: CAMUNDA_CLIENT_MODE, Value: self-managed }
+            - { Name: CAMUNDA_CLIENT_RESTADDRESS, Value: 'http://orchestration-cluster-rest:8080' }
+            - { Name: CAMUNDA_CLIENT_GRPCADDRESS, Value: 'http://orchestration-cluster-grpc:26500' }
+            - { Name: CAMUNDA_CLIENT_AUTH_METHOD, Value: basic }
+            - { Name: CAMUNDA_CLIENT_AUTH_USERNAME, Value: connectors }
+          Secrets:
+            - { Name: CAMUNDA_CLIENT_AUTH_PASSWORD, ValueFrom: !Ref ConnectorsPasswordSecret }
+
+  ConnectorsService:
+    Type: AWS::ECS::Service
+    DependsOn: [OrchestrationService, ConnectorsListenerRule]
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ConnectorsTaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 900
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+      LoadBalancers:
+        - ContainerName: connectors
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ConnectorsTargetGroup
+
+Outputs:
+  CamundaWebUrl:
+    Description: Operate / Tasklist / Admin / REST API (login as admin)
+    Value: !Sub 'http://${WebLoadBalancer.DNSName}/'
+  ConnectorsHealthUrl:
+    Value: !Sub 'http://${WebLoadBalancer.DNSName}/connectors/actuator/health'
+  GrpcAddress:
+    Condition: CreateGrpcLb
+    Description: Zeebe gRPC endpoint for workers / zbctl / Desktop Modeler
+    Value: !Sub '${GrpcLoadBalancer.DNSName}:26500'
+  AdminUsername:
+    Value: admin
+  AdminPasswordSecretArn:
+    Description: Open in Secrets Manager -> Retrieve secret value to get the admin password
+    Value: !Ref AdminPasswordSecret
+  ConnectorsPasswordSecretArn:
+    Value: !Ref ConnectorsPasswordSecret
+  DatabaseEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+  EcsClusterName:
+    Value: !Ref Cluster
+  LogGroupName:
+    Value: !Ref LogGroup
+  VpcId:
+    Value: !Ref Vpc

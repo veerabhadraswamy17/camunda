@@ -1,0 +1,93 @@
+{
+  "family": "camunda-poc-h2",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<EXISTING_ECS_TASK_EXECUTION_ROLE>",
+  "containerDefinitions": [
+    {
+      "name": "orchestration",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/camunda/camunda:8.9.16",
+      "essential": true,
+      "memoryReservation": 2560,
+      "stopTimeout": 30,
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp", "name": "web-rest" },
+        { "containerPort": 26500, "protocol": "tcp", "name": "grpc" },
+        { "containerPort": 9600, "protocol": "tcp", "name": "management" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget --spider --quiet http://localhost:9600/actuator/health/liveness || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/camunda-poc-h2",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "orchestration"
+        }
+      },
+      "environment": [
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_TYPE", "value": "rdbms" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_URL", "value": "jdbc:h2:file:/tmp/camunda-h2/h2db" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_USERNAME", "value": "sa" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_FLUSHINTERVAL", "value": "PT0.5S" },
+        { "name": "CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_QUEUESIZE", "value": "1000" },
+
+        { "name": "CAMUNDA_SECURITY_AUTHENTICATION_METHOD", "value": "basic" },
+        { "name": "CAMUNDA_SECURITY_AUTHENTICATION_UNPROTECTEDAPI", "value": "false" },
+        { "name": "CAMUNDA_SECURITY_AUTHORIZATIONS_ENABLED", "value": "false" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_USERNAME", "value": "admin" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_PASSWORD", "value": "<CHOOSE_A_PASSWORD>" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_NAME", "value": "Admin User" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_USERS_0_EMAIL", "value": "admin@example.com" },
+        { "name": "CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_ADMIN_USERS_0", "value": "admin" },
+
+        { "name": "CAMUNDA_SYSTEM_CPUTHREADCOUNT", "value": "2" },
+        { "name": "CAMUNDA_SYSTEM_IOTHREADCOUNT", "value": "2" }
+      ]
+    },
+    {
+      "name": "connectors",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/camunda/connectors-bundle:8.9.7",
+      "essential": false,
+      "memoryReservation": 1024,
+      "stopTimeout": 30,
+      "dependsOn": [{ "containerName": "orchestration", "condition": "HEALTHY" }],
+      "portMappings": [
+        { "containerPort": 8086, "protocol": "tcp", "name": "connectors" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget --spider --quiet http://localhost:8086/actuator/health/readiness || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/camunda-poc-h2",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "connectors"
+        }
+      },
+      "environment": [
+        { "name": "SERVER_PORT", "value": "8086" },
+        { "name": "MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED", "value": "true" },
+        { "name": "CAMUNDA_CLIENT_MODE", "value": "self-managed" },
+        { "name": "CAMUNDA_CLIENT_RESTADDRESS", "value": "http://localhost:8080" },
+        { "name": "CAMUNDA_CLIENT_GRPCADDRESS", "value": "http://localhost:26500" },
+        { "name": "CAMUNDA_CLIENT_AUTH_METHOD", "value": "basic" },
+        { "name": "CAMUNDA_CLIENT_AUTH_USERNAME", "value": "admin" },
+        { "name": "CAMUNDA_CLIENT_AUTH_PASSWORD", "value": "<CHOOSE_A_PASSWORD>" }
+      ]
+    }
+  ]
+}
